@@ -1,0 +1,480 @@
+"""
+agt_ss.agents.analytics_governance
+------------------------------------
+Agent 5: Procurement Analytics & Governance
+
+Processes owned (5):
+  1. Purchase price variance (PPV) tracking — compare actuals vs. budget and
+     prior year, flag variances, root-cause by category and supplier.
+  2. Monthly procurement analytics dashboard — savings realized, pipeline,
+     contract coverage, PO compliance, and supplier performance summary.
+  3. Contract coverage & maverick spend monitoring — identify uncovered spend,
+     maverick purchasing, and off-contract buying by category.
+  4. Savings pipeline management — track sourcing initiatives from identification
+     through realisation with stage, owner, and expected close date.
+  5. Procurement maturity roadmap — score current capability maturity (1-5) and
+     generate a prioritised transformation roadmap.
+
+Can run standalone (scheduled analytics job) OR within a sourcing workflow to
+incorporate newly executed contract data from Agent 4.
+
+Data flow:
+  IN  ← state.contract_supplier (optional — enriches analytics if present)
+        state.spend_category.spend_classification
+        state.context.actuals_data (injected for testing)
+        state.context.budget_data
+        state.context.prior_year_data
+  OUT → state.analytics_governance {ppv_report, monthly_dashboard,
+                                     savings_pipeline, contract_coverage_heatmap,
+                                     maturity_roadmap}
+"""
+
+from __future__ import annotations
+
+import logging
+import statistics
+from collections import defaultdict
+from datetime import datetime, timedelta
+from typing import Any
+
+from .base import AgentToolError, BaseAgent
+from .llm import extract_json, reason
+from ..state.schema import AgentName
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Maturity model dimensions (Procurement Capability Maturity Model, PCMM)
+# ---------------------------------------------------------------------------
+
+_MATURITY_DIMENSIONS = {
+    "spend_visibility":          "Completeness and accuracy of spend data and classification",
+    "category_management":       "Structured category strategies across all major categories",
+    "supplier_management":       "ASL currency, qualification rigor, and performance measurement",
+    "sourcing_process":          "RFQ/RFP discipline, TCO analysis, and competitive events",
+    "contract_management":       "Contract coverage rate, clause standardisation, compliance",
+    "analytics_reporting":       "KPI availability, dashboard quality, and decision support",
+    "risk_management":           "Supply risk identification, monitoring, and mitigation",
+    "stakeholder_alignment":     "Procurement influence on specification and budget planning",
+    "technology_enablement":     "ERP / eProcurement / analytics tool adoption",
+    "talent_and_organisation":   "Team skills, training, and org structure effectiveness",
+}
+
+# Maturity level descriptors
+_MATURITY_LEVELS = {
+    1: "Reactive / Tactical",
+    2: "Emerging / Awareness",
+    3: "Defined / Structured",
+    4: "Managed / Optimising",
+    5: "Leading / Innovative",
+}
+
+
+class AnalyticsGovernanceAgent(BaseAgent):
+    """Full implementation of Procurement Analytics & Governance agent."""
+
+    name = AgentName.ANALYTICS_GOVERNANCE
+
+    def can_run(self, state: dict) -> bool:
+        return bool(state.get("goal"))
+
+    # =========================================================================
+    # Orchestration
+    # =========================================================================
+
+    def _execute(self, state: dict) -> dict:
+        context  = state.get("context", {})
+        logger.info("[AnalyticsGovernance] Starting")
+
+        # Step 1 — PPV report
+        ppv = self._build_ppv_report(state)
+
+        # Step 2 — monthly dashboard
+        dashboard = self._build_monthly_dashboard(state, ppv)
+
+        # Step 3 — savings pipeline
+        savings = self._build_savings_pipeline(state)
+
+        # Step 4 — contract coverage heatmap
+        coverage = self._build_contract_coverage(state)
+
+        # Step 5 — maturity roadmap (conditional or always-on)
+        roadmap = {}
+        if context.get("maturity_assessment_required", True):
+            roadmap = self._build_maturity_roadmap(state, dashboard)
+
+        logger.info("[AnalyticsGovernance] Complete — PPV variances=%d, savings_items=%d",
+                    len(ppv.get("variances", [])),
+                    len(savings))
+
+        return {
+            "analytics_governance": {
+                "ppv_report":                ppv,
+                "monthly_dashboard":         dashboard,
+                "savings_pipeline":          savings,
+                "contract_coverage_heatmap": coverage,
+                "maturity_roadmap":          roadmap,
+            }
+        }
+
+    # =========================================================================
+    # Step 1 — PPV report
+    # =========================================================================
+
+    def _build_ppv_report(self, state: dict) -> dict:
+        """
+        Compare actual purchase prices against budget and prior-year benchmarks.
+
+        PPV = (Actual Price - Budget Price) × Actual Volume
+          Negative PPV = favourable (actual < budget)
+          Positive PPV = unfavourable (actual > budget)
+        """
+        context     = state.get("context", {})
+        actuals     = context.get("actuals_data", [])
+        budget_data = context.get("budget_data", {})
+        py_data     = context.get("prior_year_data", {})
+
+        # Pull spend classification from upstream agent if available
+        classification = state.get("spend_category", {}).get("spend_classification", {})
+
+        if not actuals and not classification:
+            return self._empty_ppv()
+
+        # If we have injected actuals, compute PPV directly
+        variances = []
+        if actuals:
+            for row in actuals:
+                cat          = row.get("category", "Uncategorised")
+                actual_price = float(row.get("unit_price", 0))
+                actual_qty   = float(row.get("quantity", 0))
+                budget_price = float(budget_data.get(cat, {}).get("unit_price", actual_price))
+                py_price     = float(py_data.get(cat, {}).get("unit_price", actual_price))
+
+                ppv_vs_budget = (actual_price - budget_price) * actual_qty
+                ppv_vs_py     = (actual_price - py_price) * actual_qty
+
+                variances.append({
+                    "category":          cat,
+                    "supplier_id":       row.get("supplier_id"),
+                    "actual_price":      round(actual_price, 4),
+                    "budget_price":      round(budget_price, 4),
+                    "prior_year_price":  round(py_price, 4),
+                    "quantity":          actual_qty,
+                    "ppv_vs_budget":     round(ppv_vs_budget, 2),
+                    "ppv_vs_prior_year": round(ppv_vs_py, 2),
+                    "ppv_pct_budget":    round((actual_price - budget_price) / budget_price * 100, 2)
+                                         if budget_price else 0.0,
+                    "flag":              "unfavourable" if ppv_vs_budget > 0 else
+                                         "favourable"   if ppv_vs_budget < 0 else "neutral",
+                })
+        else:
+            # Estimate from spend classification aggregates — proxy PPV
+            for cat, metrics in classification.items():
+                spend        = metrics.get("total_spend", 0)
+                budget_spend = float(budget_data.get(cat, {}).get("total_spend", spend))
+                ppv_proxy    = spend - budget_spend
+                if ppv_proxy != 0:
+                    variances.append({
+                        "category":          cat,
+                        "supplier_id":       None,
+                        "actual_spend":      round(spend, 2),
+                        "budget_spend":      round(budget_spend, 2),
+                        "ppv_vs_budget":     round(ppv_proxy, 2),
+                        "ppv_pct_budget":    round((spend - budget_spend) / budget_spend * 100, 2)
+                                             if budget_spend else 0.0,
+                        "flag":              "unfavourable" if ppv_proxy > 0 else "favourable",
+                        "note":              "Category-level estimate — unit price data not available",
+                    })
+
+        total_ppv        = sum(v.get("ppv_vs_budget", 0) for v in variances)
+        favourable_count = sum(1 for v in variances if v.get("flag") == "favourable")
+        unfav_count      = sum(1 for v in variances if v.get("flag") == "unfavourable")
+
+        # Sort: largest unfavourable variances first
+        variances.sort(key=lambda v: v.get("ppv_vs_budget", 0), reverse=True)
+
+        return {
+            "variances":             variances,
+            "total_ppv_usd":         round(total_ppv, 2),
+            "total_savings_gap":     round(abs(total_ppv) if total_ppv > 0 else 0, 2),
+            "favourable_count":      favourable_count,
+            "unfavourable_count":    unfav_count,
+            "top_unfavourable":      variances[:5],
+            "reporting_period":      context.get("reporting_period", datetime.utcnow().strftime("%Y-%m")),
+            "generated_at":          datetime.utcnow().isoformat(),
+        }
+
+    def _empty_ppv(self) -> dict:
+        return {
+            "variances": [], "total_ppv_usd": 0.0, "total_savings_gap": 0.0,
+            "favourable_count": 0, "unfavourable_count": 0, "top_unfavourable": [],
+            "note": "No actuals or classification data available",
+            "generated_at": datetime.utcnow().isoformat(),
+        }
+
+    # =========================================================================
+    # Step 2 — Monthly dashboard
+    # =========================================================================
+
+    def _build_monthly_dashboard(self, state: dict, ppv: dict) -> dict:
+        """
+        Aggregate the core procurement KPI dashboard.
+        Pulls from upstream agent outputs where available;
+        falls back to context-injected data.
+        """
+        context        = state.get("context", {})
+        contract_data  = state.get("contract_supplier", {})
+        sourcing_data  = state.get("sourcing_execution", {})
+        classification = state.get("spend_category", {}).get("spend_classification", {})
+
+        total_spend        = sum(m.get("total_spend", 0) for m in classification.values())
+        contract_value     = contract_data.get("contract_record", {}).get("total_value", 0)
+
+        # Savings realized: sum of favourable PPV + any completed sourcing event savings
+        award = sourcing_data.get("award_recommendation", {})
+        tco_savings = 0.0
+        if award.get("tco_contract_total"):
+            budget = state.get("budget", 0) or award.get("tco_contract_total")
+            tco_savings = max(0, budget - award.get("tco_contract_total", budget))
+
+        favourable_ppv    = sum(abs(v.get("ppv_vs_budget", 0))
+                                for v in ppv.get("variances", [])
+                                if v.get("flag") == "favourable")
+        savings_realized  = round(tco_savings + favourable_ppv, 2)
+
+        # Contract coverage: contracts active / total addressable spend
+        covered_spend      = contract_value if contract_value else total_spend * 0.72  # benchmark
+        contract_cov_pct   = round(covered_spend / total_spend * 100, 1) if total_spend else 0.0
+
+        # PO compliance: proxy based on tail spend maverick flags
+        tail = state.get("spend_category", {}).get("tail_spend_report", {})
+        maverick_flags     = len(tail.get("maverick_buying_flags", []))
+        po_compliance_pct  = max(60.0, 95.0 - maverick_flags * 5)
+
+        supplier_count     = len(state.get("supplier_market", {}).get("approved_supplier_list", []))
+
+        return {
+            "reporting_period":        context.get("reporting_period", datetime.utcnow().strftime("%Y-%m")),
+            "total_managed_spend":     round(total_spend, 2),
+            "savings_realized":        savings_realized,
+            "savings_pipeline_value":  context.get("savings_pipeline_value", 0.0),
+            "savings_target":          context.get("savings_target", total_spend * 0.05),
+            "savings_pct_of_spend":    round(savings_realized / total_spend * 100, 2) if total_spend else 0.0,
+            "contract_coverage_pct":   contract_cov_pct,
+            "po_compliance_pct":       round(po_compliance_pct, 1),
+            "active_supplier_count":   supplier_count,
+            "contracts_expiring_90d":  context.get("contracts_expiring_90d", 0),
+            "open_sourcing_events":    1 if sourcing_data.get("event_type") else 0,
+            "ppv_total_usd":           ppv.get("total_ppv_usd", 0.0),
+            "generated_at":            datetime.utcnow().isoformat(),
+        }
+
+    # =========================================================================
+    # Step 3 — Savings pipeline
+    # =========================================================================
+
+    def _build_savings_pipeline(self, state: dict) -> list[dict]:
+        """
+        Build the current savings pipeline register.
+        Includes: identification, analysis, negotiation, contracted, and
+        realised stages.  Sourcing event in progress contributes at negotiation stage.
+        """
+        context   = state.get("context", {})
+        injection = context.get("savings_pipeline_items", [])
+
+        if injection:
+            return injection
+
+        pipeline = []
+
+        # Derive pipeline items from workflow data
+        sourcing   = state.get("sourcing_execution", {})
+        award      = sourcing.get("award_recommendation", {})
+        strategies = state.get("spend_category", {}).get("category_strategies", [])
+
+        for i, strat in enumerate(strategies[:5]):
+            cat          = strat.get("category", f"Category-{i}")
+            tco_saving   = 0.0
+            stage        = "identification"
+
+            if award and i == 0:
+                stage = "contracted" if state.get("contract_supplier", {}).get("contract_record") else "negotiation"
+                tco_total = award.get("tco_contract_total", 0)
+                budget    = state.get("budget", 0) or tco_total
+                tco_saving = max(0, budget - tco_total)
+
+            pipeline.append({
+                "initiative_id":     f"SAV-{datetime.utcnow().strftime('%Y%m')}-{i+1:03d}",
+                "category":          cat,
+                "description":       f"{strat.get('approach', 'strategic_sourcing').replace('_', ' ').title()} — {cat}",
+                "stage":             stage,
+                "estimated_savings": round(tco_saving, 2) if tco_saving else
+                                     round(strat.get("profit_impact", 5) * 10000, 2),
+                "currency":          "USD",
+                "owner":             "sourcing_team",
+                "target_close_date": (datetime.utcnow() + timedelta(days=30 + i * 30)).strftime("%Y-%m-%d"),
+                "confidence_pct":    {"identification": 25, "analysis": 50,
+                                      "negotiation": 75, "contracted": 90,
+                                      "realised": 100}.get(stage, 50),
+                "created_at":        datetime.utcnow().isoformat(),
+            })
+
+        return pipeline
+
+    # =========================================================================
+    # Step 4 — Contract coverage heatmap
+    # =========================================================================
+
+    def _build_contract_coverage(self, state: dict) -> dict:
+        """
+        Build a contract coverage heatmap by category.
+        Identifies uncovered spend, at-risk contracts (expiring ≤90 days),
+        and categories with no active preferred supplier.
+        """
+        classification = state.get("spend_category", {}).get("spend_classification", {})
+        contract       = state.get("contract_supplier", {}).get("contract_record", {})
+        context        = state.get("context", {})
+
+        # If a contract was just executed, mark its category as covered
+        covered_category = state.get("category") if contract.get("status") in (
+            "executed", "pending_signature") else None
+
+        categories_coverage = {}
+        total_spend         = 0.0
+        covered_spend       = 0.0
+
+        for cat, metrics in classification.items():
+            spend = metrics.get("total_spend", 0)
+            total_spend += spend
+
+            is_covered = (cat == covered_category) or context.get(
+                "covered_categories", {}).get(cat, False)
+
+            categories_coverage[cat] = {
+                "total_spend":       round(spend, 2),
+                "spend_share_pct":   metrics.get("spend_share_pct", 0),
+                "is_covered":        is_covered,
+                "contract_status":   "active" if is_covered else "none",
+                "expiry_date":       contract.get("expiry_date") if is_covered else None,
+                "risk_level":        "low" if is_covered else (
+                    "high" if metrics.get("spend_share_pct", 0) > 5 else "medium"),
+            }
+            if is_covered:
+                covered_spend += spend
+
+        uncovered = {cat: v for cat, v in categories_coverage.items() if not v["is_covered"]}
+        high_risk_uncovered = [cat for cat, v in uncovered.items()
+                               if v.get("risk_level") == "high"]
+
+        return {
+            "categories":             categories_coverage,
+            "total_spend":            round(total_spend, 2),
+            "covered_spend":          round(covered_spend, 2),
+            "uncovered_spend":        round(total_spend - covered_spend, 2),
+            "coverage_pct":           round(covered_spend / total_spend * 100, 1) if total_spend else 0.0,
+            "high_risk_uncovered":    high_risk_uncovered,
+            "uncovered_category_count": len(uncovered),
+            "generated_at":           datetime.utcnow().isoformat(),
+        }
+
+    # =========================================================================
+    # Step 5 — Maturity roadmap
+    # =========================================================================
+
+    def _build_maturity_roadmap(self, state: dict, dashboard: dict) -> dict:
+        """
+        Score current procurement maturity (1-5 per dimension) and generate
+        a prioritised transformation roadmap with initiatives, owners, and timelines.
+        """
+        context = state.get("context", {})
+
+        # Derive objective maturity signals from workflow state
+        spend_classified    = bool(state.get("spend_category", {}).get("spend_classification"))
+        has_kategory_strat  = bool(state.get("spend_category", {}).get("category_strategies"))
+        has_asl             = bool(state.get("supplier_market", {}).get("approved_supplier_list"))
+        has_tco             = bool(state.get("sourcing_execution", {}).get("tco_comparison"))
+        contract_cov        = dashboard.get("contract_coverage_pct", 0)
+        po_compliance       = dashboard.get("po_compliance_pct", 0)
+
+        # Heuristic baseline scores from observable workflow data
+        baseline_scores: dict[str, float] = {
+            "spend_visibility":       4.0 if spend_classified else 2.0,
+            "category_management":    4.0 if has_kategory_strat else 2.0,
+            "supplier_management":    3.5 if has_asl else 2.0,
+            "sourcing_process":       4.0 if has_tco else 2.5,
+            "contract_management":    3.5 if contract_cov > 70 else 2.0,
+            "analytics_reporting":    3.0 if dashboard.get("savings_realized", 0) > 0 else 2.0,
+            "risk_management":        2.5,
+            "stakeholder_alignment":  2.5,
+            "technology_enablement":  context.get("tech_maturity_score", 3.0),
+            "talent_and_organisation": context.get("talent_maturity_score", 2.5),
+        }
+
+        # Use LLM to refine and generate roadmap
+        try:
+            maturity_output = extract_json(
+                system=(
+                    "You are a procurement transformation consultant. "
+                    "Given baseline maturity scores and context, refine the scores "
+                    "and generate a prioritised transformation roadmap. Return JSON:\n"
+                    "{\n"
+                    "  dimension_scores: {dimension: float (1-5)},\n"
+                    "  overall_score: float (1-5),\n"
+                    "  current_level: int (1-5),\n"
+                    "  current_level_label: str,\n"
+                    "  target_level: int (1-5),\n"
+                    "  target_level_label: str,\n"
+                    "  initiatives: [\n"
+                    "    {title, dimension, priority: 'quick_win'|'strategic'|'foundational',\n"
+                    "     description, expected_benefit, effort_months: int,\n"
+                    "     timeline_start_months: int, owner: str}\n"
+                    "  ],\n"
+                    "  key_gaps: [str],\n"
+                    "  executive_summary: str (3-4 sentences)\n"
+                    "}"
+                ),
+                user=(
+                    f"Baseline dimension scores:\n{baseline_scores}\n\n"
+                    f"Context:\n"
+                    f"  Industry: {context.get('industry', 'aerospace / defense')}\n"
+                    f"  Contract coverage: {contract_cov:.1f}%\n"
+                    f"  PO compliance: {po_compliance:.1f}%\n"
+                    f"  Savings realized: ${dashboard.get('savings_realized', 0):,.0f}\n"
+                    f"  Goal: {state.get('goal', '')}\n\n"
+                    "Identify top 5-7 transformation initiatives. "
+                    "Prioritise quick wins (< 3 months) alongside strategic moves."
+                ),
+                max_tokens=2000,
+            )
+
+            return {
+                **maturity_output,
+                "baseline_scores": baseline_scores,
+                "maturity_levels": _MATURITY_LEVELS,
+                "dimensions":      _MATURITY_DIMENSIONS,
+                "generated_at":    datetime.utcnow().isoformat(),
+            }
+
+        except Exception as exc:
+            logger.warning("[AnalyticsGovernance] Maturity roadmap LLM failed: %s", exc)
+            overall = statistics.mean(baseline_scores.values())
+            current_level = max(1, min(5, round(overall)))
+            return {
+                "dimension_scores":    baseline_scores,
+                "overall_score":       round(overall, 2),
+                "current_level":       current_level,
+                "current_level_label": _MATURITY_LEVELS[current_level],
+                "target_level":        min(5, current_level + 1),
+                "target_level_label":  _MATURITY_LEVELS[min(5, current_level + 1)],
+                "initiatives":         [],
+                "key_gaps":            [d for d, s in baseline_scores.items() if s < 3.0],
+                "executive_summary":   (
+                    f"Current procurement maturity assessed at level {current_level} "
+                    f"({_MATURITY_LEVELS[current_level]}). "
+                    "Detailed roadmap generation failed — manual assessment recommended."
+                ),
+                "baseline_scores":     baseline_scores,
+                "maturity_levels":     _MATURITY_LEVELS,
+                "dimensions":          _MATURITY_DIMENSIONS,
+                "generated_at":        datetime.utcnow().isoformat(),
+            }
