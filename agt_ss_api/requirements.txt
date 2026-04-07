@@ -1,0 +1,25 @@
+# AGT-SS FastAPI Service — Python dependencies
+# Install: pip install -r requirements.txt
+
+# ── Web framework ─────────────────────────────────────────────────────────
+fastapi==0.115.5
+uvicorn[standard]==0.32.0
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# ── AGT-SS agent runtime ──────────────────────────────────────────────────
+langgraph>=0.2.0
+anthropic>=0.40.0
+typing_extensions>=4.0.0
+
+# ── AWS persistence (Aurora PostgreSQL) ───────────────────────────────────
+psycopg2-binary==2.9.10
+boto3==1.35.0                  # AWS SDK (Secrets Manager, etc.)
+
+# ── HTTP client (used by Anthropic SDK) ───────────────────────────────────
+httpx>=0.27.0
+
+# ── Testing ───────────────────────────────────────────────────────────────
+pytest==8.3.3
+pytest-asyncio==0.24.0
+httpx                          # TestClient transport
