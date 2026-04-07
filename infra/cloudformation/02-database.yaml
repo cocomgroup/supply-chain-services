@@ -1,0 +1,209 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AGT-SS Database Stack — Aurora Serverless v2 PostgreSQL cluster,
+  DB credentials in Secrets Manager, and parameter store entries.
+  Imports outputs from 01-network.yaml.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [development, staging, production]
+    Default: production
+
+  DbName:
+    Type: String
+    Default: agt_ss
+
+  DbMasterUsername:
+    Type: String
+    Default: agt_ss_admin
+    NoEcho: true
+
+  # Aurora Serverless v2 capacity units — scales between min and max
+  AuroraMinCapacity:
+    Type: Number
+    Default: 0.5
+    Description: Minimum Aurora Capacity Units (0.5 = ~1 vCPU, pauses when idle)
+
+  AuroraMaxCapacity:
+    Type: Number
+    Default: 4
+    Description: Maximum Aurora Capacity Units
+
+  BackupRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 35
+
+Conditions:
+  IsProduction: !Equals [!Ref Environment, production]
+
+Resources:
+
+  # ─── DB Master Password in Secrets Manager ────────────────────────────────
+
+  DbMasterSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "agt-ss/${Environment}/db/master"
+      Description: AGT-SS Aurora master credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "${DbMasterUsername}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: AGT-SS
+
+  # App user credentials (less privileged than master)
+  DbAppSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "agt-ss/${Environment}/db/app"
+      Description: AGT-SS Aurora application user credentials
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "agt_ss_app", "dbname": "${DbName}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\\'
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── Aurora Cluster Parameter Group ──────────────────────────────────────
+
+  DbClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Description: !Sub "AGT-SS Aurora PostgreSQL 15 parameters (${Environment})"
+      Family: aurora-postgresql15
+      Parameters:
+        # Enable logical replication for future CDC use
+        rds.logical_replication: "1"
+        # Larger shared buffers for workflow JSON payloads
+        shared_preload_libraries: "pg_stat_statements"
+        log_min_duration_statement: "1000"   # log queries > 1s
+        idle_in_transaction_session_timeout: "30000"  # 30s
+
+  # ─── Aurora Serverless v2 Cluster ────────────────────────────────────────
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: !If [IsProduction, Retain, Delete]
+    UpdateReplacePolicy: !If [IsProduction, Retain, Delete]
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: "15.4"
+      DatabaseName: !Ref DbName
+      MasterUsername: !Sub "{{resolve:secretsmanager:${DbMasterSecret}:SecretString:username}}"
+      MasterUserPassword: !Sub "{{resolve:secretsmanager:${DbMasterSecret}:SecretString:password}}"
+      DBClusterParameterGroupName: !Ref DbClusterParameterGroup
+      DBSubnetGroupName:
+        Fn::ImportValue: !Sub "agt-ss-${Environment}-DbSubnetGroupName"
+      VpcSecurityGroupIds:
+        - Fn::ImportValue: !Sub "agt-ss-${Environment}-AuroraSecurityGroupId"
+      BackupRetentionPeriod: !Ref BackupRetentionDays
+      PreferredBackupWindow: "03:00-04:00"
+      PreferredMaintenanceWindow: "sun:04:00-sun:05:00"
+      StorageEncrypted: true
+      EnableCloudwatchLogsExports:
+        - postgresql
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !Ref AuroraMinCapacity
+        MaxCapacity: !Ref AuroraMaxCapacity
+      DeletionProtection: !If [IsProduction, true, false]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: AGT-SS
+
+  # Primary writer instance (Serverless v2)
+  AuroraWriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref AuroraCluster
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub "agt-ss-aurora-writer-${Environment}"
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Read replica (production only)
+  AuroraReaderInstance:
+    Type: AWS::RDS::DBInstance
+    Condition: IsProduction
+    Properties:
+      Engine: aurora-postgresql
+      DBInstanceClass: db.serverless
+      DBClusterIdentifier: !Ref AuroraCluster
+      PubliclyAccessible: false
+      Tags:
+        - Key: Name
+          Value: !Sub "agt-ss-aurora-reader-${Environment}"
+
+  # ─── Attach host/port back into the app secret ────────────────────────────
+
+  DbAppSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DbAppSecret
+      TargetId: !Ref AuroraCluster
+      TargetType: AWS::RDS::DBCluster
+
+  # ─── SSM Parameter Store — non-secret config referenced by ECS ───────────
+
+  SsmDbHost:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/agt-ss/${Environment}/db/host"
+      Type: String
+      Value: !GetAtt AuroraCluster.Endpoint.Address
+      Description: Aurora writer endpoint
+
+  SsmDbPort:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/agt-ss/${Environment}/db/port"
+      Type: String
+      Value: !GetAtt AuroraCluster.Endpoint.Port
+
+  SsmDbName:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/agt-ss/${Environment}/db/name"
+      Type: String
+      Value: !Ref DbName
+
+Outputs:
+  ClusterEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub "agt-ss-${Environment}-DbEndpoint"
+
+  ClusterPort:
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+    Export:
+      Name: !Sub "agt-ss-${Environment}-DbPort"
+
+  ClusterIdentifier:
+    Value: !Ref AuroraCluster
+    Export:
+      Name: !Sub "agt-ss-${Environment}-DbClusterId"
+
+  DbMasterSecretArn:
+    Value: !Ref DbMasterSecret
+    Export:
+      Name: !Sub "agt-ss-${Environment}-DbMasterSecretArn"
+
+  DbAppSecretArn:
+    Value: !Ref DbAppSecret
+    Export:
+      Name: !Sub "agt-ss-${Environment}-DbAppSecretArn"

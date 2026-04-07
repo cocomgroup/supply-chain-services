@@ -1,0 +1,41 @@
+# Version control
+.git
+.gitignore
+
+# Python artifacts
+**/__pycache__
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.pytest_cache
+**/.mypy_cache
+**/.ruff_cache
+
+# Test files (not needed in image)
+**/tests/
+**/test_*.py
+
+# Development files
+**/.env
+**/.env.*
+*.env
+
+# Infrastructure (not deployed in container)
+infra/
+
+# Documentation
+*.md
+*.docx
+*.pdf
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Local checkpoint store
+/tmp/agt_ss_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db

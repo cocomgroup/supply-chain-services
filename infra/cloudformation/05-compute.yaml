@@ -1,0 +1,501 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AGT-SS Compute Stack — ECS Fargate cluster, Application Load Balancer,
+  task definition, service, auto-scaling, and CloudWatch log groups + alarms.
+  Imports from 01-network, 02-database, 03-secrets, and 04-iam-ecr.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [development, staging, production]
+    Default: production
+
+  ImageTag:
+    Type: String
+    Default: latest
+    Description: Docker image tag to deploy (e.g. v1.2.3 or git SHA)
+
+  # Task sizing
+  TaskCpu:
+    Type: Number
+    Default: 1024
+    AllowedValues: [256, 512, 1024, 2048, 4096]
+    Description: ECS task CPU units (1024 = 1 vCPU)
+
+  TaskMemory:
+    Type: Number
+    Default: 3072
+    Description: ECS task memory in MiB (must match valid CPU/memory combinations)
+
+  # Service sizing
+  DesiredCount:
+    Type: Number
+    Default: 2
+    Description: Desired number of running tasks
+
+  MinCapacity:
+    Type: Number
+    Default: 1
+    Description: Auto-scaling minimum task count
+
+  MaxCapacity:
+    Type: Number
+    Default: 10
+    Description: Auto-scaling maximum task count
+
+  # ALB
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate ARN for HTTPS listener (leave empty to use HTTP only)
+
+  # Alerting
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email address for CloudWatch alarm notifications
+
+Conditions:
+  HasCertificate: !Not [!Equals [!Ref CertificateArn, ""]]
+  HasAlertEmail:  !Not [!Equals [!Ref AlertEmail, ""]]
+  IsProduction:   !Equals [!Ref Environment, production]
+
+Resources:
+
+  # ─── CloudWatch Log Groups ────────────────────────────────────────────────
+
+  AppLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/agt-ss/${Environment}/api"
+      RetentionInDays: !If [IsProduction, 90, 14]
+
+  # ─── SNS for alarms ──────────────────────────────────────────────────────
+
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "agt-ss-alarms-${Environment}"
+      Subscription:
+        - !If
+          - HasAlertEmail
+          - Protocol: email
+            Endpoint: !Ref AlertEmail
+          - !Ref AWS::NoValue
+
+  # ─── ECS Cluster ──────────────────────────────────────────────────────────
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: !Sub "agt-ss-${Environment}"
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Project
+          Value: AGT-SS
+
+  # ─── Application Load Balancer ────────────────────────────────────────────
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub "agt-ss-alb-${Environment}"
+      Scheme: internet-facing
+      Type: application
+      IpAddressType: ipv4
+      SecurityGroups:
+        - Fn::ImportValue: !Sub "agt-ss-${Environment}-AlbSecurityGroupId"
+      Subnets:
+        - Fn::ImportValue: !Sub "agt-ss-${Environment}-PublicSubnet1Id"
+        - Fn::ImportValue: !Sub "agt-ss-${Environment}-PublicSubnet2Id"
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: "1860"    # > workflow_timeout_seconds (1800)
+        - Key: access_logs.s3.enabled
+          Value: !If [IsProduction, "true", "false"]
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  AlbTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub "agt-ss-tg-${Environment}"
+      Protocol: HTTP
+      Port: 8000
+      TargetType: ip
+      VpcId:
+        Fn::ImportValue: !Sub "agt-ss-${Environment}-VpcId"
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: "200"
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "30"
+        - Key: stickiness.enabled
+          Value: "false"
+
+  # HTTP listener — redirects to HTTPS if cert present, otherwise serves directly
+  AlbListenerHttp:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - !If
+          - HasCertificate
+          - Type: redirect
+            RedirectConfig:
+              Protocol: HTTPS
+              Port: "443"
+              StatusCode: HTTP_301
+          - Type: forward
+            TargetGroupArn: !Ref AlbTargetGroup
+
+  # HTTPS listener (only created when certificate is provided)
+  AlbListenerHttps:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCertificate
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Protocol: HTTPS
+      Port: 443
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref AlbTargetGroup
+
+  # ─── ECS Task Definition ──────────────────────────────────────────────────
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: !Sub "agt-ss-api-${Environment}"
+      Cpu: !Ref TaskCpu
+      Memory: !Ref TaskMemory
+      NetworkMode: awsvpc
+      RequiresCompatibilities:
+        - FARGATE
+      ExecutionRoleArn:
+        Fn::ImportValue: !Sub "agt-ss-${Environment}-EcsExecRoleArn"
+      TaskRoleArn:
+        Fn::ImportValue: !Sub "agt-ss-${Environment}-EcsTaskRoleArn"
+      ContainerDefinitions:
+        - Name: api
+          Image: !Sub
+            - "${EcrUri}:${ImageTag}"
+            - EcrUri:
+                Fn::ImportValue: !Sub "agt-ss-${Environment}-EcrUri"
+              ImageTag: !Ref ImageTag
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref AppLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+          # Health check mirrors ALB — Fargate replaces unhealthy tasks
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health')\""
+            Interval: 30
+            Timeout: 10
+            Retries: 3
+            StartPeriod: 60
+          # Secrets injected as environment variables at task start
+          Secrets:
+            - Name: ANTHROPIC_API_KEY
+              ValueFrom: !Sub
+                - "${SecretArn}:ANTHROPIC_API_KEY::"
+                - SecretArn:
+                    Fn::ImportValue: !Sub "agt-ss-${Environment}-AnthropicSecretArn"
+            - Name: API_KEYS
+              ValueFrom:
+                Fn::ImportValue: !Sub "agt-ss-${Environment}-AppApiKeysSecretArn"
+            - Name: DB_PASSWORD
+              ValueFrom: !Sub
+                - "${SecretArn}:password::"
+                - SecretArn:
+                    Fn::ImportValue: !Sub "agt-ss-${Environment}-DbAppSecretArn"
+          Environment:
+            - Name: ENVIRONMENT
+              Value: !Ref Environment
+            - Name: AWS_REGION
+              Value: !Ref AWS::Region
+            - Name: DB_HOST
+              Value:
+                Fn::ImportValue: !Sub "agt-ss-${Environment}-DbEndpoint"
+            - Name: DB_PORT
+              Value:
+                Fn::ImportValue: !Sub "agt-ss-${Environment}-DbPort"
+            - Name: DB_NAME
+              Value: agt_ss
+            - Name: DB_USER
+              Value: agt_ss_app
+            - Name: DB_SCHEMA
+              Value: public
+            - Name: RUN_WORKFLOWS_ASYNC
+              Value: "true"
+            - Name: WORKFLOW_TIMEOUT_SECONDS
+              Value: "1800"
+            - Name: LOG_LEVEL
+              Value: !If [IsProduction, "info", "debug"]
+            - Name: WORKERS
+              Value: "1"
+            - Name: DISABLE_AUTH
+              Value: "false"
+          # Prevent runaway processes from consuming all task memory
+          LinuxParameters:
+            InitProcessEnabled: true
+          StopTimeout: 30
+          ReadonlyRootFilesystem: false
+
+  # ─── ECS Service ──────────────────────────────────────────────────────────
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - AlbListenerHttp
+    Properties:
+      ServiceName: !Sub "agt-ss-api-${Environment}"
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - Fn::ImportValue: !Sub "agt-ss-${Environment}-EcsSecurityGroupId"
+          Subnets:
+            - Fn::ImportValue: !Sub "agt-ss-${Environment}-PrivateSubnet1Id"
+            - Fn::ImportValue: !Sub "agt-ss-${Environment}-PrivateSubnet2Id"
+      LoadBalancers:
+        - ContainerName: api
+          ContainerPort: 8000
+          TargetGroupArn: !Ref AlbTargetGroup
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # ─── Auto-Scaling ─────────────────────────────────────────────────────────
+
+  ScalingTarget:
+    Type: AWS::ApplicationAutoScaling::ScalableTarget
+    Properties:
+      MinCapacity: !Ref MinCapacity
+      MaxCapacity: !Ref MaxCapacity
+      ResourceId: !Sub "service/${EcsCluster}/${EcsService.Name}"
+      ScalableDimension: ecs:service:DesiredCount
+      ServiceNamespace: ecs
+      RoleARN: !Sub "arn:aws:iam::${AWS::AccountId}:role/aws-service-role/ecs.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_ECSService"
+
+  # Scale on CPU — LangGraph workflow runs are CPU-bound
+  CpuScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "agt-ss-cpu-scaling-${Environment}"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 65.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageCPUUtilization
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  # Scale on memory — large JSON workflow states can be memory-intensive
+  MemoryScalingPolicy:
+    Type: AWS::ApplicationAutoScaling::ScalingPolicy
+    Properties:
+      PolicyName: !Sub "agt-ss-memory-scaling-${Environment}"
+      PolicyType: TargetTrackingScaling
+      ScalingTargetId: !Ref ScalingTarget
+      TargetTrackingScalingPolicyConfiguration:
+        TargetValue: 75.0
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ECSServiceAverageMemoryUtilization
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+
+  # ─── CloudWatch Alarms ────────────────────────────────────────────────────
+
+  AlbUnhealthyHostAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "agt-ss-${Environment}-unhealthy-hosts"
+      AlarmDescription: One or more ECS tasks are failing health checks
+      MetricName: UnHealthyHostCount
+      Namespace: AWS/ApplicationELB
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt Alb.LoadBalancerFullName
+        - Name: TargetGroup
+          Value: !GetAtt AlbTargetGroup.TargetGroupFullName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 2
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: breaching
+      AlarmActions:
+        - !Ref AlarmTopic
+      OKActions:
+        - !Ref AlarmTopic
+
+  AlbHighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "agt-ss-${Environment}-high-latency"
+      AlarmDescription: ALB P99 latency exceeds 5 seconds
+      MetricName: TargetResponseTime
+      Namespace: AWS/ApplicationELB
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !GetAtt Alb.LoadBalancerFullName
+      ExtendedStatistic: p99
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 5.0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  AlbHighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "agt-ss-${Environment}-5xx-errors"
+      AlarmDescription: HTTP 5xx error rate exceeds 1% over 5 minutes
+      Metrics:
+        - Id: errors
+          MetricStat:
+            Metric:
+              MetricName: HTTPCode_Target_5XX_Count
+              Namespace: AWS/ApplicationELB
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt Alb.LoadBalancerFullName
+            Period: 300
+            Stat: Sum
+        - Id: requests
+          MetricStat:
+            Metric:
+              MetricName: RequestCount
+              Namespace: AWS/ApplicationELB
+              Dimensions:
+                - Name: LoadBalancer
+                  Value: !GetAtt Alb.LoadBalancerFullName
+            Period: 300
+            Stat: Sum
+        - Id: error_rate
+          Expression: "errors / requests * 100"
+          Label: "5xx error rate %"
+      ComparisonOperator: GreaterThanThreshold
+      Threshold: 1.0
+      EvaluationPeriods: 2
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  EcsHighCpuAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "agt-ss-${Environment}-high-cpu"
+      AlarmDescription: ECS service CPU exceeds 85% — scaling may not keep up
+      MetricName: CPUUtilization
+      Namespace: AWS/ECS
+      Dimensions:
+        - Name: ClusterName
+          Value: !Ref EcsCluster
+        - Name: ServiceName
+          Value: !GetAtt EcsService.Name
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 85.0
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+
+  DeadLetterWorkflowAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "agt-ss-${Environment}-dead-letter-workflows"
+      AlarmDescription: >
+        One or more workflows have entered DEAD_LETTER status.
+        Check /agt-ss/{env}/api logs for root cause.
+      MetricName: DeadLetterWorkflows
+      Namespace: AGT-SS
+      Dimensions:
+        - Name: Environment
+          Value: !Ref Environment
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 0
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlarmTopic
+
+Outputs:
+  ClusterName:
+    Value: !Ref EcsCluster
+    Export:
+      Name: !Sub "agt-ss-${Environment}-ClusterName"
+
+  ServiceName:
+    Value: !GetAtt EcsService.Name
+    Export:
+      Name: !Sub "agt-ss-${Environment}-ServiceName"
+
+  AlbDnsName:
+    Value: !GetAtt Alb.DNSName
+    Description: Point your DNS CNAME here
+    Export:
+      Name: !Sub "agt-ss-${Environment}-AlbDns"
+
+  AlbArn:
+    Value: !Ref Alb
+    Export:
+      Name: !Sub "agt-ss-${Environment}-AlbArn"
+
+  ApiUrl:
+    Value: !If
+      - HasCertificate
+      - !Sub "https://${Alb.DNSName}"
+      - !Sub "http://${Alb.DNSName}"
+    Description: Base URL of the AGT-SS API
+
+  TaskDefinitionArn:
+    Value: !Ref TaskDefinition
+    Export:
+      Name: !Sub "agt-ss-${Environment}-TaskDefArn"
+
+  LogGroupName:
+    Value: !Ref AppLogGroup
+    Export:
+      Name: !Sub "agt-ss-${Environment}-LogGroup"
