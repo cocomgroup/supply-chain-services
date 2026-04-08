@@ -1,0 +1,6 @@
+langgraph
+anthropic
+boto3
+psycopg2-binary
+pgvector
+sqlalchemy
